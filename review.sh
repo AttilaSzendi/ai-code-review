@@ -2,6 +2,10 @@
 set -euo pipefail
 
 MAX_DIFF_CHARS=100000
+COMMENT_TAG="<!-- ai-code-review -->"
+
+# Built-in file patterns to always exclude from review
+DEFAULT_EXCLUDE="*.lock composer.lock package-lock.json yarn.lock pnpm-lock.yaml *.min.js *.min.css *.map *.snap *.svg *.png *.jpg *.jpeg *.gif *.ico *.woff *.woff2 *.ttf *.eot"
 
 # ── Validate ──────────────────────────────────────────────
 if [[ -z "${PR_NUMBER:-}" ]]; then
@@ -20,11 +24,57 @@ PR_TITLE=$(gh pr view "$PR_NUMBER" --repo "$REPO" --json title -q '.title')
 PR_BODY=$(gh pr view "$PR_NUMBER" --repo "$REPO" --json body -q '.body')
 
 # ── Diff ──────────────────────────────────────────────────
-DIFF=$(gh pr diff "$PR_NUMBER" --repo "$REPO" 2>/dev/null || true)
+DIFF_ERR=$(mktemp)
+DIFF=$(gh pr diff "$PR_NUMBER" --repo "$REPO" 2>"$DIFF_ERR") || true
 
 if [[ -z "$DIFF" ]]; then
+  if [[ -s "$DIFF_ERR" ]]; then
+    echo "::warning::gh pr diff failed: $(cat "$DIFF_ERR")"
+  fi
+  rm -f "$DIFF_ERR"
   echo "Empty diff, skipping review."
   exit 0
+fi
+rm -f "$DIFF_ERR"
+
+# ── Filter excluded files from diff ──────────────────────
+ALL_EXCLUDE="$DEFAULT_EXCLUDE"
+if [[ -n "${EXCLUDE_PATTERNS:-}" ]]; then
+  IFS=',' read -ra CUSTOM_PATTERNS <<< "$EXCLUDE_PATTERNS"
+  for pattern in "${CUSTOM_PATTERNS[@]}"; do
+    ALL_EXCLUDE="${ALL_EXCLUDE} $(echo "$pattern" | xargs)"
+  done
+fi
+
+# Build awk pattern: convert globs to regex (*.lock → \.lock$, etc.)
+AWK_PATTERN=""
+for pattern in $ALL_EXCLUDE; do
+  regex=$(echo "$pattern" | sed 's/\./\\./g; s/\*/.*/g')
+  if [[ -n "$AWK_PATTERN" ]]; then
+    AWK_PATTERN="${AWK_PATTERN}|${regex}"
+  else
+    AWK_PATTERN="${regex}"
+  fi
+done
+
+if [[ -n "$AWK_PATTERN" ]]; then
+  FILTERED_DIFF=$(echo "$DIFF" | awk -v pat="($AWK_PATTERN)" '
+    /^diff --git/ {
+      skip = 0
+      fname = $NF
+      sub(/^b\//, "", fname)
+      if (fname ~ pat) skip = 1
+    }
+    !skip { print }
+  ')
+  if [[ -z "$FILTERED_DIFF" ]]; then
+    echo "All files excluded by filter, skipping review."
+    exit 0
+  fi
+  if [[ ${#FILTERED_DIFF} -lt ${#DIFF} ]]; then
+    echo "Filtered out excluded file patterns from diff."
+  fi
+  DIFF="$FILTERED_DIFF"
 fi
 
 TRUNCATED=false
@@ -129,18 +179,30 @@ INPUT_TOKENS=$(echo "$BODY" | jq -r '.usage.input_tokens // "?"')
 OUTPUT_TOKENS=$(echo "$BODY" | jq -r '.usage.output_tokens // "?"')
 echo "Tokens used: ${INPUT_TOKENS} input, ${OUTPUT_TOKENS} output"
 
-# ── Post review comment ──────────────────────────────────
-COMMENT_FILE=$(mktemp)
-cat > "$COMMENT_FILE" <<EOF
+# ── Post or update review comment ─────────────────────────
+COMMENT_BODY="${COMMENT_TAG}
 ## 🤖 AI Code Review
 
 ${REVIEW}
 
 ---
-<sub>Reviewed by Claude (${MODEL}) · ${INPUT_TOKENS} input / ${OUTPUT_TOKENS} output tokens</sub>
-EOF
+<sub>Reviewed by Claude (${MODEL}) · ${INPUT_TOKENS} input / ${OUTPUT_TOKENS} output tokens</sub>"
 
-gh pr comment "$PR_NUMBER" --repo "$REPO" --body-file "$COMMENT_FILE"
-rm -f "$COMMENT_FILE"
+COMMENT_FILE=$(mktemp)
+echo "$COMMENT_BODY" > "$COMMENT_FILE"
 
-echo "✅ Review posted on PR #${PR_NUMBER}"
+# Find existing AI review comment by hidden tag
+EXISTING_COMMENT_ID=$(gh api "repos/${REPO}/issues/${PR_NUMBER}/comments" \
+  --jq ".[] | select(.body | startswith(\"${COMMENT_TAG}\")) | .id" 2>/dev/null | head -1)
+
+if [[ -n "$EXISTING_COMMENT_ID" ]]; then
+  gh api "repos/${REPO}/issues/comments/${EXISTING_COMMENT_ID}" \
+    --method PATCH \
+    --field body=@"$COMMENT_FILE"
+  rm -f "$COMMENT_FILE"
+  echo "✅ Updated existing review comment on PR #${PR_NUMBER}"
+else
+  gh pr comment "$PR_NUMBER" --repo "$REPO" --body-file "$COMMENT_FILE"
+  rm -f "$COMMENT_FILE"
+  echo "✅ Review posted on PR #${PR_NUMBER}"
+fi
