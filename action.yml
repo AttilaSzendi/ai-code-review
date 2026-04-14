@@ -30,4 +30,5 @@ runs:
         PROJECT_CONTEXT: ${{ inputs.project-context }}
         PR_NUMBER: ${{ github.event.pull_request.number }}
         REPO: ${{ github.repository }}
+        GH_TOKEN: ${{ github.token }}
       run: bash ${{ github.action_path }}/review.sh
