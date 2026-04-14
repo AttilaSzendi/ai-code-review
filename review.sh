@@ -49,7 +49,7 @@ fi
 # Build awk pattern: convert globs to regex (*.lock → \.lock$, etc.)
 AWK_PATTERN=""
 for pattern in $ALL_EXCLUDE; do
-  regex=$(echo "$pattern" | sed 's/\./\\./g; s/\*/.*/g')
+  regex=$(echo "$pattern" | sed 's/\./[.]/g; s/\*/.*/g')
   if [[ -n "$AWK_PATTERN" ]]; then
     AWK_PATTERN="${AWK_PATTERN}|${regex}"
   else
