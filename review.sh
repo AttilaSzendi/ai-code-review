@@ -2,6 +2,7 @@
 set -euo pipefail
 
 MAX_DIFF_CHARS=100000
+MAX_FILE_CHARS=10000
 COMMENT_TAG="<!-- ai-code-review -->"
 
 # Built-in file patterns to always exclude from review
@@ -46,7 +47,6 @@ if [[ -n "${EXCLUDE_PATTERNS:-}" ]]; then
   done
 fi
 
-# Build awk pattern: convert globs to regex (*.lock → \.lock$, etc.)
 AWK_PATTERN=""
 for pattern in $ALL_EXCLUDE; do
   regex=$(echo "$pattern" | sed 's/\./[.]/g; s/\*/.*/g')
@@ -84,6 +84,29 @@ if [[ ${#DIFF} -gt $MAX_DIFF_CHARS ]]; then
   echo "::warning::Diff truncated to ${MAX_DIFF_CHARS} chars."
 fi
 
+# ── Collect full file contents for context ────────────────
+CHANGED_FILES=$(echo "$DIFF" | grep "^diff --git" | sed 's/diff --git a\/.* b\///')
+FILE_CONTEXT=""
+FILES_INCLUDED=0
+for file in $CHANGED_FILES; do
+  if [[ -f "$file" ]]; then
+    FILE_SIZE=$(wc -c < "$file")
+    if [[ "$FILE_SIZE" -lt "$MAX_FILE_CHARS" ]]; then
+      FILE_CONTEXT="${FILE_CONTEXT}
+--- ${file} (full file) ---
+$(cat "$file")
+--- end ${file} ---
+"
+      FILES_INCLUDED=$((FILES_INCLUDED + 1))
+    else
+      echo "Skipping full content of ${file} (${FILE_SIZE} bytes > ${MAX_FILE_CHARS} limit)"
+    fi
+  fi
+done
+if [[ "$FILES_INCLUDED" -gt 0 ]]; then
+  echo "Included full content of ${FILES_INCLUDED} changed file(s) for context."
+fi
+
 # ── Project rules (optional file in repo root) ────────────
 RULES=""
 if [[ -f ".code-review.md" ]]; then
@@ -93,6 +116,7 @@ fi
 
 # ── System prompt ─────────────────────────────────────────
 SYSTEM="You are a senior code reviewer. Review the pull request diff below.
+You also have access to the full content of changed files for additional context.
 
 Focus on:
 - Bugs and logic errors
@@ -104,10 +128,26 @@ Focus on:
 Rules:
 - Be concise and actionable — no fluff
 - Only flag important issues, skip nitpicking (formatting, naming style)
-- If the code looks good, say so in one sentence
-- Group findings by severity: 🔴 Critical, 🟡 Warning, 🔵 Suggestion
-- Reference specific file names and line numbers from the diff
-- Write in English"
+- Line numbers MUST refer to lines visible in the diff (added or modified lines in the new version)
+- Write in English
+
+You MUST return your review as a JSON object with this exact structure. Do NOT wrap it in markdown code blocks.
+
+{
+  \"summary\": \"1-2 sentence overall assessment of the changes\",
+  \"findings\": [
+    {
+      \"path\": \"relative/path/to/file\",
+      \"line\": 42,
+      \"severity\": \"critical\",
+      \"body\": \"Markdown description of the issue and suggested fix\"
+    }
+  ]
+}
+
+Severity values: \"critical\" for bugs and security issues, \"warning\" for potential problems, \"suggestion\" for improvements.
+If the code looks good, return an empty findings array with a positive summary.
+IMPORTANT: Each finding's \"line\" must be a line number from the NEW version of the file that appears in the diff. The \"path\" must match the file path shown in the diff."
 
 if [[ -n "$RULES" ]]; then
   SYSTEM="${SYSTEM}
@@ -130,7 +170,7 @@ Description: ${PR_BODY:-No description provided.}"
 if [[ "$TRUNCATED" == "true" ]]; then
   USER_MSG="${USER_MSG}
 
-⚠️ The diff was truncated. Review what is available."
+Warning: The diff was truncated. Review what is available."
 fi
 
 USER_MSG="${USER_MSG}
@@ -138,6 +178,13 @@ USER_MSG="${USER_MSG}
 \`\`\`diff
 ${DIFF}
 \`\`\`"
+
+if [[ -n "$FILE_CONTEXT" ]]; then
+  USER_MSG="${USER_MSG}
+
+Full file contents for context:
+${FILE_CONTEXT}"
+fi
 
 # ── Claude API call ───────────────────────────────────────
 PAYLOAD=$(jq -n \
@@ -167,9 +214,9 @@ if [[ "$HTTP_CODE" != "200" ]]; then
   exit 1
 fi
 
-REVIEW=$(echo "$BODY" | jq -r '.content[0].text')
+REVIEW_TEXT=$(echo "$BODY" | jq -r '.content[0].text')
 
-if [[ -z "$REVIEW" || "$REVIEW" == "null" ]]; then
+if [[ -z "$REVIEW_TEXT" || "$REVIEW_TEXT" == "null" ]]; then
   echo "::error::Empty response from Claude."
   exit 1
 fi
@@ -179,19 +226,112 @@ INPUT_TOKENS=$(echo "$BODY" | jq -r '.usage.input_tokens // "?"')
 OUTPUT_TOKENS=$(echo "$BODY" | jq -r '.usage.output_tokens // "?"')
 echo "Tokens used: ${INPUT_TOKENS} input, ${OUTPUT_TOKENS} output"
 
-# ── Post or update review comment ─────────────────────────
-COMMENT_BODY="${COMMENT_TAG}
-## 🤖 AI Code Review
+# ── Parse structured response ─────────────────────────────
+# Strip markdown code blocks if Claude wrapped the JSON
+CLEAN_JSON=$(echo "$REVIEW_TEXT" | sed '/^```json$/d; /^```$/d')
+REVIEW_JSON=$(echo "$CLEAN_JSON" | jq '.' 2>/dev/null) || true
 
-${REVIEW}
+if [[ -z "$REVIEW_JSON" || "$REVIEW_JSON" == "null" ]]; then
+  echo "::warning::Could not parse JSON from Claude response, falling back to plain comment."
+  post_fallback_comment "$REVIEW_TEXT"
+  exit 0
+fi
+
+# ── Extract review data ──────────────────────────────────
+SUMMARY=$(echo "$REVIEW_JSON" | jq -r '.summary // "No summary provided."')
+FINDINGS_COUNT=$(echo "$REVIEW_JSON" | jq '.findings | length')
+CRITICAL_COUNT=$(echo "$REVIEW_JSON" | jq '[.findings[] | select(.severity == "critical")] | length')
+WARNING_COUNT=$(echo "$REVIEW_JSON" | jq '[.findings[] | select(.severity == "warning")] | length')
+SUGGESTION_COUNT=$(echo "$REVIEW_JSON" | jq '[.findings[] | select(.severity == "suggestion")] | length')
+
+echo "Findings: ${CRITICAL_COUNT} critical, ${WARNING_COUNT} warning, ${SUGGESTION_COUNT} suggestion"
+
+# ── Determine review event ────────────────────────────────
+if [[ "$CRITICAL_COUNT" -gt 0 ]]; then
+  REVIEW_EVENT="REQUEST_CHANGES"
+elif [[ "$FINDINGS_COUNT" -eq 0 ]]; then
+  REVIEW_EVENT="APPROVE"
+else
+  REVIEW_EVENT="COMMENT"
+fi
+echo "Review decision: ${REVIEW_EVENT}"
+
+# ── Build review body (summary) ──────────────────────────
+REVIEW_BODY="${SUMMARY}"
+if [[ "$FINDINGS_COUNT" -gt 0 ]]; then
+  BADGES=""
+  [[ "$CRITICAL_COUNT" -gt 0 ]] && BADGES="${BADGES}🔴 ${CRITICAL_COUNT} critical  "
+  [[ "$WARNING_COUNT" -gt 0 ]] && BADGES="${BADGES}🟡 ${WARNING_COUNT} warning  "
+  [[ "$SUGGESTION_COUNT" -gt 0 ]] && BADGES="${BADGES}🔵 ${SUGGESTION_COUNT} suggestion"
+  REVIEW_BODY="${REVIEW_BODY}
+
+${BADGES}"
+fi
+REVIEW_BODY="${REVIEW_BODY}
 
 ---
 <sub>Reviewed by Claude (${MODEL}) · ${INPUT_TOKENS} input / ${OUTPUT_TOKENS} output tokens</sub>"
 
-COMMENT_FILE=$(mktemp)
-echo "$COMMENT_BODY" > "$COMMENT_FILE"
+# ── Build inline comments ────────────────────────────────
+INLINE_COMMENTS=$(echo "$REVIEW_JSON" | jq '[.findings[] | {
+  path: .path,
+  line: .line,
+  side: "RIGHT",
+  body: ((if .severity == "critical" then "🔴 **Critical** — "
+         elif .severity == "warning" then "🟡 **Warning** — "
+         else "🔵 **Suggestion** — " end) + .body)
+}]')
 
-# Find existing AI review comment by hidden tag
+# ── Try posting as PR review with inline comments ─────────
+REVIEW_PAYLOAD=$(jq -n \
+  --arg event "$REVIEW_EVENT" \
+  --arg body "$REVIEW_BODY" \
+  --argjson comments "$INLINE_COMMENTS" \
+  '{event: $event, body: $body, comments: $comments}')
+
+REVIEW_RESULT=$(gh api "repos/${REPO}/pulls/${PR_NUMBER}/reviews" \
+  --method POST \
+  --input - <<< "$REVIEW_PAYLOAD" 2>&1) || true
+
+if echo "$REVIEW_RESULT" | jq -e '.id' > /dev/null 2>&1; then
+  echo "✅ Review posted on PR #${PR_NUMBER} (${REVIEW_EVENT}, ${FINDINGS_COUNT} inline comments)"
+  # Clean up old fallback comment if exists
+  OLD_COMMENT_ID=$(gh api "repos/${REPO}/issues/${PR_NUMBER}/comments" \
+    --jq ".[] | select(.body | startswith(\"${COMMENT_TAG}\")) | .id" 2>/dev/null | head -1)
+  if [[ -n "$OLD_COMMENT_ID" ]]; then
+    gh api "repos/${REPO}/issues/comments/${OLD_COMMENT_ID}" --method DELETE 2>/dev/null || true
+    echo "Cleaned up old fallback comment."
+  fi
+  exit 0
+fi
+
+# ── Fallback: post as regular comment with all findings ───
+REVIEW_ERR=$(echo "$REVIEW_RESULT" | jq -r '.message // "unknown error"' 2>/dev/null || echo "unknown error")
+echo "::warning::Inline review failed (${REVIEW_ERR}), falling back to comment."
+
+FALLBACK_BODY="${COMMENT_TAG}
+## 🤖 AI Code Review
+
+${SUMMARY}
+"
+
+if [[ "$FINDINGS_COUNT" -gt 0 ]]; then
+  FALLBACK_FINDINGS=$(echo "$REVIEW_JSON" | jq -r '.findings[] |
+    (if .severity == "critical" then "### 🔴 Critical"
+     elif .severity == "warning" then "### 🟡 Warning"
+     else "### 🔵 Suggestion" end) +
+    " — `" + .path + ":" + (.line | tostring) + "`\n\n" + .body + "\n"')
+  FALLBACK_BODY="${FALLBACK_BODY}
+${FALLBACK_FINDINGS}"
+fi
+
+FALLBACK_BODY="${FALLBACK_BODY}
+---
+<sub>Reviewed by Claude (${MODEL}) · ${INPUT_TOKENS} input / ${OUTPUT_TOKENS} output tokens</sub>"
+
+COMMENT_FILE=$(mktemp)
+echo "$FALLBACK_BODY" > "$COMMENT_FILE"
+
 EXISTING_COMMENT_ID=$(gh api "repos/${REPO}/issues/${PR_NUMBER}/comments" \
   --jq ".[] | select(.body | startswith(\"${COMMENT_TAG}\")) | .id" 2>/dev/null | head -1)
 
@@ -199,10 +339,9 @@ if [[ -n "$EXISTING_COMMENT_ID" ]]; then
   gh api "repos/${REPO}/issues/comments/${EXISTING_COMMENT_ID}" \
     --method PATCH \
     --field body=@"$COMMENT_FILE"
-  rm -f "$COMMENT_FILE"
-  echo "✅ Updated existing review comment on PR #${PR_NUMBER}"
+  echo "✅ Updated fallback comment on PR #${PR_NUMBER}"
 else
   gh pr comment "$PR_NUMBER" --repo "$REPO" --body-file "$COMMENT_FILE"
-  rm -f "$COMMENT_FILE"
-  echo "✅ Review posted on PR #${PR_NUMBER}"
+  echo "✅ Fallback comment posted on PR #${PR_NUMBER}"
 fi
+rm -f "$COMMENT_FILE"
